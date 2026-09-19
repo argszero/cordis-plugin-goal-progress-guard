@@ -1,0 +1,18 @@
+# The @argszero/cordis-plugin-goal-progress-guard bundle patch.
+#
+# With an empty config the deferral dimension is on and the no-progress
+# dimension is unenforced: the guard says so in one line at mount.
+#
+#   - insert:
+#       - id: goal-progress-guard
+#         config:
+#           deferWhileJobsPending: true   # pause the goal while its jobs run, resume when they settle
+#           maxBarrenRounds: 3            # stop after N consecutive rounds with no tool call
+#           dryRun: false                 # true logs the deferral or stop it would write
+#
+# Inside a bundle whose patch already has rows, add the same `insert` entry
+# instead of a second document.
+
+- insert:
+    - id: goal-progress-guard
+      name: '@argszero/cordis-plugin-goal-progress-guard'

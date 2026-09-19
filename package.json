@@ -1,0 +1,64 @@
+{
+  "name": "@argszero/cordis-plugin-goal-progress-guard",
+  "description": "Progress judgement for dsh autonomous goal rounds: pause an active goal while its background jobs are still running (resume when the last one settles), and stop a goal whose rounds have stopped producing tool calls. The harness driver stops a goal only at its own `maxGoalRounds`, and `idle` there means only \"no turn is running\" — so an agent waiting on a job is indistinguishable from one that is finished, and must keep talking to fill the rounds. Source: discussion #7198 (with #1831 / #4664). It programs only against documented service shapes and imports no `@deepseek-ai/dsh-*` package at runtime; its only runtime dependency is `@deepseek-ai/schemastery` plus the `@deepseek-ai/cordis` peer.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/argszero/cordis-plugin-goal-progress-guard.git"
+  },
+  "homepage": "https://github.com/argszero/cordis-plugin-goal-progress-guard#readme",
+  "bugs": {
+    "url": "https://github.com/argszero/cordis-plugin-goal-progress-guard/issues"
+  },
+  "keywords": [
+    "cordis",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "goal",
+    "goal-round",
+    "stall",
+    "no-progress",
+    "background-jobs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.5.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "pretest": "tsc",
+    "prepublishOnly": "tsc",
+    "test": "node --test \"test/*.spec.mjs\""
+  }
+}
