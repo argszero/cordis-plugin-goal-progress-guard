@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-goal-progress-guard",
   "description": "Progress judgement for dsh autonomous goal rounds: pause an active goal while its background jobs are still running (resume when the last one settles), and stop a goal whose rounds have stopped producing tool calls. The harness driver stops a goal only at its own `maxGoalRounds`, and `idle` there means only \"no turn is running\" — so an agent waiting on a job is indistinguishable from one that is finished, and must keep talking to fill the rounds. Source: discussion #7198 (with #1831 / #4664). It programs only against documented service shapes and imports no `@deepseek-ai/dsh-*` package at runtime; its only runtime dependency is `@deepseek-ai/schemastery` plus the `@deepseek-ai/cordis` peer.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -59,6 +59,7 @@
     "build": "tsc",
     "pretest": "tsc",
     "prepublishOnly": "tsc",
-    "test": "node --test \"test/*.spec.mjs\""
+    "test": "node --test \"test/*.spec.mjs\"",
+    "test:defects": "node scripts/inject-defects.mjs"
   }
 }

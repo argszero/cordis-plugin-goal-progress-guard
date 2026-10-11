@@ -63,6 +63,29 @@
  *   reports through another channel) is not covered; the same pause/resume
  *   shape extends to it, with a different trigger.
  *
+ * ## The seam it reads, and the 0.2.0 repair
+ *
+ * Both dimensions program only against documented public surfaces. The jobs
+ * dimension was written against the registry as it stood *before* the
+ * 2026-09-03 seam consolidation and kept two assumptions that consolidation
+ * removed:
+ *
+ * - `JobRegistry.list` takes the caller's **session id**, and `JobView.owner`
+ *   is that session id — never the `Agent`. v0.1.0 passed the agent, so no owned
+ *   job was ever visible.
+ * - Settlements arrive on the registry's one event stream,
+ *   `jobs.events.subscribe(filter, listener)`. The three listener families it
+ *   replaced — `onJobDone`, `onJobsChanged`, `onOutput` — are gone, so v0.1.0's
+ *   settlement hook never existed to be called.
+ *
+ * The two compounded into the worst outcome this file can produce, and it was
+ * **not** inert: `list`'s unowned disjunct still admitted every unowned job, so
+ * a running shared job *did* pause the goal — and the pause could never be
+ * lifted, because the resume rode the hook that no longer exists. That is the
+ * stranded goal {@link resumeDecision} calls worse than lifting early. 0.2.0
+ * repairs both: the caller is the session id, and the settlement rides the
+ * documented event stream.
+ *
  * @packageDocumentation
  */
 
@@ -256,22 +279,61 @@ export interface GoalsLike {
   block(agent: unknown, ref: GoalRefLike, reason: { code: string; message: string }): GoalViewLike
 }
 
-/** One job as `JobsService.list` reports it. */
+/** One job as `JobsService.list` projects it — the `JobView` subset read here. */
 export interface JobLike {
+  /** Current lifecycle state: `running`, `stopping`, or one terminal value. */
   readonly status: string
+  /** Owning session id; absent for an unowned job, which every caller can see. */
+  readonly owner?: string
 }
 
-/** The jobs service surface this plugin uses. */
-export interface JobsLike {
-  list(caller?: unknown): JobLike[]
+/**
+ * One announcement from the registry's event stream.
+ *
+ * Only `settled` is read here; the other members (`registered`, `progress`,
+ * `stopping`, `removed`, `output`) carry facts this plugin gets from `list`
+ * instead, at the moment it actually needs them.
+ */
+export interface JobEventLike {
+  readonly type: string
+  /** The job's fresh projection, on every lifecycle member. */
+  readonly job?: JobLike
 }
 
-/** A disposable registration, as `onJobDone` returns. */
+/**
+ * Who a subscription hears about, spelled the way the registry's
+ * `JobEventFilter` spells it.
+ *
+ * `{ owner }` hears that session's jobs plus every unowned job.
+ * `{ owners: 'scope' }` hears the owners composed under the subscribing
+ * context — the right choice for a plugin, whose mount scope is the composition
+ * it serves, and which must not hear another preset's agents.
+ */
+export type JobEventFilterLike =
+  | { readonly owner: string }
+  | { readonly owners: 'all' | 'scope' }
+
+/** A disposable registration, as `subscribe` returns one. */
 export type Disposer = () => void
 
-/** The jobs service plus its settlement hook. */
-export interface JobSource extends JobsLike {
-  onJobDone(listener: (snapshot: unknown, owner: unknown) => void): Disposer
+/**
+ * The jobs service surface this plugin uses, all of it documented and public.
+ *
+ * The registry's own terms matter here, because both were misread once:
+ *
+ * - `list` takes the caller's **session id**. Omission sees only unowned jobs.
+ *   The registry compares the caller against the owning session, so an `Agent`
+ *   matches no owned job and silently degrades to the unowned set.
+ * - settlements ride {@link JobsLike.events}. There is exactly one event stream;
+ *   a per-listener settlement hook is not part of the seam.
+ */
+export interface JobsLike {
+  /** Caller-owned and unowned jobs, in registration order. */
+  list(caller?: string): JobLike[]
+  /** The registry's one event stream. */
+  readonly events: {
+    subscribe(filter: JobEventFilterLike, listener: (event: JobEventLike) => void): Disposer
+  }
 }
 
 /**
@@ -304,12 +366,18 @@ export interface ProgressGuard {
   observeToolCall(sessionId: string): void
   /** Take both decisions for an agent that has just gone quiescent. */
   evaluate(agent: unknown): void
-  /** Reconsider a deferred goal after a job settled. */
-  jobSettled(owner: unknown): void
+  /**
+   * Reconsider a deferred goal after a job settled.
+   *
+   * The argument is the settled job's owner exactly as the registry reports it:
+   * a session id, or `undefined` for an unowned job — which every session can
+   * see, so it can lift any deferral.
+   */
+  jobSettled(owner: string | undefined): void
   /** Drop everything remembered about one agent. */
   forget(agent: unknown): void
   /** Install the optional jobs service once it becomes available. */
-  attachJobs(jobs: JobSource): void
+  attachJobs(jobs: JobsLike): void
   /** What the guard believes about one session, for tests and reporting. */
   observed(sessionId: string): ObservedProgress
 }
@@ -353,7 +421,7 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
    * The jobs service, once installed. Not read from `ctx`: this plugin does not
    * require the service, and an undeclared read would throw at mount.
    */
-  let jobs: JobSource | undefined
+  let jobs: JobsLike | undefined
 
   const deferEnabled = config.deferWhileJobsPending !== false
   const maxBarrenRounds = config.maxBarrenRounds
@@ -382,11 +450,19 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     }
   }
 
-  /** Unsettled jobs this agent owns, or `undefined` when not observable. */
-  function unsettledJobs(agent: unknown): number | undefined {
+  /**
+   * Unsettled jobs this session owns, or `undefined` when not observable.
+   *
+   * The caller is a session id by construction — the registry compares it
+   * against the owning session, so handing it the agent would match no owned
+   * job and silently leave only the unowned disjunct. Both call sites already
+   * hold the id, so the invariant rides the parameter type rather than a runtime
+   * branch nothing can reach.
+   */
+  function unsettledJobs(sessionId: string): number | undefined {
     if (jobs === undefined) return undefined
     try {
-      return jobs.list(agent).filter(isUnsettled).length
+      return jobs.list(sessionId).filter(isUnsettled).length
     } catch (error: unknown) {
       ctx.logger.warn(`goal-progress-guard: could not read background jobs: ${renderThrown(error)}`)
       return undefined
@@ -416,7 +492,7 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
       deferWhileJobsPending: deferEnabled,
       phase: goal.phase,
       activation: goal.activation,
-      unsettledJobs: unsettledJobs(agent),
+      unsettledJobs: unsettledJobs(sessionId),
     }) === 'defer') {
       if (dryRun) ctx.logger.info(`goal-progress-guard: would pause goal "${goal.id}" while its background jobs run (dry-run)`)
       else if (pauseGoal(agent, goal)) state.deferred = { agent, goalId: goal.id }
@@ -478,7 +554,7 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     const goal = readGoal(agent)
     const decision = resumeDecision({
       phase: goal?.phase ?? 'absent',
-      unsettledJobs: unsettledJobs(agent),
+      unsettledJobs: unsettledJobs(sessionId),
     })
     if (decision === 'none') return
     state.deferred = undefined
@@ -497,12 +573,25 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     state.toolCallsInWindow = 0
   }
 
-  function jobSettled(owner: unknown): void {
-    if (sessionIdOf(owner) !== undefined) {
-      release(owner)
+  /** Reconsider one deferred session, looked up by the id the registry reports. */
+  function releaseSession(sessionId: string): void {
+    const state = states.get(sessionId)
+    if (state?.deferred === undefined) return
+    release(state.deferred.agent)
+  }
+
+  /**
+   * Reconsider a deferral after a settlement, whoever triggered it.
+   *
+   * The owner arrives as the registry reports it on `JobView`: a session id for
+   * an owned job, `undefined` for an unowned one. An unowned job is visible to
+   * every agent, so its settlement can lift any deferral.
+   */
+  function jobSettled(owner: string | undefined): void {
+    if (owner !== undefined) {
+      releaseSession(owner)
       return
     }
-    // An unowned job is visible to every agent, so it can lift any deferral.
     for (const state of [...states.values()]) {
       if (state.deferred !== undefined) release(state.deferred.agent)
     }
@@ -514,7 +603,7 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
   }
 
   /** Install the jobs service once it becomes available. */
-  function attachJobs(source: JobSource): void {
+  function attachJobs(source: JobsLike): void {
     jobs = source
   }
 
@@ -608,9 +697,17 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   // The jobs service is optional by design: a composition without it keeps the
   // no-progress dimension and leaves the deferral dimension inert.
+  //
+  // Settlements ride the registry's one event stream, subscribed by scope: the
+  // plugin serves the composition it is mounted in, and must not hear another
+  // preset's agents. `settled` carries the job's projection, whose `owner` is
+  // the session id the deferral bookkeeping is keyed by.
   ctx.inject(['jobs'], (jobsCtx) => {
-    const jobs = (jobsCtx as unknown as { jobs: JobSource }).jobs
+    const jobs = (jobsCtx as unknown as { jobs: JobsLike }).jobs
     guard.attachJobs(jobs)
-    jobsCtx.effect(() => jobs.onJobDone((_snapshot: unknown, owner: unknown) => { guard.jobSettled(owner) }))
+    jobsCtx.effect(() => jobs.events.subscribe({ owners: 'scope' }, (event) => {
+      if (event.type !== 'settled') return
+      guard.jobSettled(event.job?.owner)
+    }))
   })
 }

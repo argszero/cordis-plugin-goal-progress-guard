@@ -108,31 +108,83 @@ function goalsService({ goal = undefined, getThrows = false, pauseThrows = false
 }
 
 /**
- * A `jobs` service stand-in, including the settlement hook.
+ * A `jobs` service stand-in carrying **exactly the documented surface**.
  *
- * `list` mirrors the real filter: a job is visible to the agent that owns it,
- * and unowned jobs are visible to everyone.
+ * This fixture is the regression guard for a defect class that shipped once, in
+ * v0.1.0: the plugin called `list(agent)` and read settlements from a
+ * per-listener `onJobDone` hook. The registry's real terms are that `list` takes
+ * the caller's **session id** — `JobView.owner` is that id, never the `Agent` —
+ * and that settlements arrive on its one event stream,
+ * `events.subscribe(filter, listener)`; the three listener families
+ * (`onJobDone`, `onJobsChanged`, `onOutput`) were removed by the 2026-09-03 jobs
+ * seam consolidation, and `JobView.owner` stopped being an `Agent` at the same
+ * time.
+ *
+ * So the fixture **enforces the contract instead of mirroring the caller**: it
+ * asserts the caller is a string, and it offers no settlement hook to call. A
+ * stand-in that accepted the agent (v0.1.0's own fixture compared
+ * `job.owner?.id === caller?.id`) is exactly what let the defect through a green
+ * suite — the implementation and its twin were wrong together.
  */
 function jobsService({ jobs = [] } = {}) {
   const listeners = new Set()
   const state = { jobs: jobs.map(job => ({ ...job })) }
-  const visible = (caller) => state.jobs.filter(job => job.owner === undefined || job.owner?.id === caller?.id)
+  const callers = []
+  const filters = []
+
+  /** The visible set, filtered the way the registry filters it. */
+  const visible = (caller) => {
+    assert.ok(caller === undefined || typeof caller === 'string',
+      'jobs.list() takes the caller session id: the registry compares it against the owning session, so an Agent matches nothing')
+    return state.jobs.filter(job => job.owner === undefined || job.owner === caller)
+  }
+
   return {
     state,
-    /** Settle one job and notify listeners, the way the registry does. */
+    /** Every caller `list` was invoked with, in order. */
+    callers,
+    /** Every filter `events.subscribe` was invoked with, in order. */
+    filters,
+    /** Hand one event to the subscribers, the way the registry routes it. */
+    announce(event) {
+      for (const listener of [...listeners]) listener(event)
+    },
+    /**
+     * Settle one job's recorded state **without** announcing anything.
+     *
+     * This is what gives a negative assertion its teeth: with the job already
+     * settled in the registry, a lift the plugin attempts succeeds, so a test
+     * that expects no resume is measuring the plugin's decision rather than a
+     * job that merely refuses to go away.
+     */
+    markSettled(id, status = 'completed') {
+      const job = state.jobs.find(candidate => candidate.id === id)
+      if (job === undefined) throw new Error(`no such job: ${id}`)
+      job.status = status
+    },
+    /** Settle one job and announce it, the way the registry does. */
     settle(id, status = 'completed') {
       const job = state.jobs.find(candidate => candidate.id === id)
       if (job === undefined) throw new Error(`no such job: ${id}`)
       job.status = status
-      for (const listener of [...listeners]) listener(job, job.owner)
+      this.announce({
+        type: 'settled',
+        job: { ...job },
+        cause: status === 'killed' ? 'kill' : 'producer',
+        awaited: false,
+      })
     },
     service: {
       list(caller) {
+        callers.push(caller)
         return visible(caller).map(job => ({ ...job }))
       },
-      onJobDone(listener) {
-        listeners.add(listener)
-        return () => listeners.delete(listener)
+      events: {
+        subscribe(filter, listener) {
+          filters.push(filter)
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
       },
     },
   }
@@ -251,7 +303,7 @@ test('every reason code the plugin can emit is one the harness validator accepts
 test('control arm: without the plugin, an idle agent with a running job is left alone', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const ctx = new Context()
   ctx.provide('goals', goals.service)
   ctx.provide('jobs', jobs.service)
@@ -263,7 +315,7 @@ test('control arm: without the plugin, an idle agent with a running job is left 
 test('a goal is paused while its job runs, and resumed when that job settles', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ goals, jobs })
 
   ctx.emit('agent/status', { agent, status: 'idle' })
@@ -276,10 +328,84 @@ test('a goal is paused while its job runs, and resumed when that job settles', a
   assert.equal(goals.state.goal.activation, 'armed')
 })
 
+test('the job lookup asks for the session id, never the agent', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
+  const agent = liveAgent('dsh-a')
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
+  const { ctx } = await mount({ goals, jobs })
+
+  ctx.emit('agent/status', { agent, status: 'idle' })
+
+  // The fixture asserts the type; this asserts what it costs to get it wrong.
+  assert.deepEqual(jobs.callers, ['dsh-a'],
+    'JobRegistry.list takes the caller session id — an Agent matches no owned job')
+  assert.equal(goals.pauses.length, 1,
+    'and the owned job is what deferred it, which only a matching caller can see')
+})
+
+test('the settlement rides the registry event stream, and only a settlement lifts a deferral', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
+  const agent = liveAgent('dsh-a')
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
+  const { ctx } = await mount({ goals, jobs })
+
+  assert.deepEqual(jobs.filters, [{ owners: 'scope' }],
+    'settlements arrive on jobs.events.subscribe — the per-listener onJobDone hook no longer exists')
+
+  ctx.emit('agent/status', { agent, status: 'idle' })
+  assert.equal(goals.pauses.length, 1)
+
+  // From here the job is settled in the registry, so ANY lift the plugin
+  // attempts succeeds. What the three announcements below measure is therefore
+  // the plugin's decision, not an unsettled job holding the deferral open: with
+  // the job still running, every one of them would "pass" for the wrong reason.
+  jobs.markSettled('j1')
+  const settledEvent = (owner) => ({ type: 'settled', job: { id: 'j1', status: 'completed', owner }, cause: 'producer', awaited: false })
+
+  jobs.announce({ type: 'progress', job: { id: 'j1', status: 'completed', owner: 'dsh-a' } })
+  assert.deepEqual(goals.resumes, [], 'a progress line is not a settlement')
+
+  jobs.announce(settledEvent('dsh-other'))
+  assert.deepEqual(goals.resumes, [], "another session's job says nothing about this one")
+
+  jobs.announce(settledEvent('dsh-a'))
+  assert.equal(goals.resumes.length, 1, 'the session the settled job names is the one released')
+})
+
+test('the plugin touches only members the jobs service actually publishes', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
+  const agent = liveAgent('dsh-a')
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
+
+  // The plugin reaches for a member that is absent from this stand-in only if it
+  // is coded against a contract the registry does not publish — which is how
+  // v0.1.0 came to call `jobs.onJobDone`, a hook removed on 2026-09-03. Property
+  // reads are what a removed *method* looks like from the outside: the read
+  // succeeds and yields `undefined`, so only the read itself is observable here.
+  const touched = new Set()
+  const watched = new Proxy(jobs.service, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string') touched.add(prop)
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+
+  const ctx = new Context()
+  ctx.provide('goals', goals.service)
+  ctx.provide('jobs', watched)
+  await ctx.plugin({ name, inject, apply, Config }, {})
+  ctx.emit('agent/status', { agent, status: 'idle' })
+  jobs.settle('j1')
+
+  assert.deepEqual([...touched].sort(), ['events', 'list'],
+    'the jobs service publishes list(caller) and events.subscribe(filter, listener) — nothing else')
+  assert.equal(goals.resumes.length, 1, 'and both of the members it did touch are the ones that work')
+})
+
 test('the deferral happens before the driver could have queued the next round', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const ctx = new Context()
   ctx.provide('goals', goals.service)
   ctx.provide('jobs', jobs.service)
@@ -299,7 +425,7 @@ test('the deferral happens before the driver could have queued the next round', 
 test('a deferral does not advance the barren streak, and a resumed round is judged normally', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ config: { maxBarrenRounds: 1 }, goals, jobs })
 
   // Two quiescent edges with a pending job: waiting, not drifting.
@@ -318,7 +444,7 @@ test('a deferral does not advance the barren streak, and a resumed round is judg
 test('two jobs: the goal stays paused until the last one settles', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }, { id: 'j2', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }, { id: 'j2', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ goals, jobs })
 
   ctx.emit('agent/status', { agent, status: 'idle' })
@@ -335,7 +461,7 @@ test('two jobs: the goal stays paused until the last one settles', async () => {
 test('a goal a human already resumed is forgotten rather than resumed again', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ goals, jobs })
 
   ctx.emit('agent/status', { agent, status: 'idle' })
@@ -447,7 +573,7 @@ test('the first sight of a goal seeds the window instead of judging it', async (
 test('a non-idle status is not a decision edge', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ goals, jobs })
 
   for (const status of ['running', 'running', 'running']) ctx.emit('agent/status', { agent, status })
@@ -457,7 +583,7 @@ test('a non-idle status is not a decision edge', async () => {
 test('dry-run logs the deferral and the stop it would write, and writes neither', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ config: { dryRun: true, maxBarrenRounds: 1 }, goals, jobs })
 
   ctx.emit('agent/status', { agent, status: 'idle' })
@@ -468,7 +594,7 @@ test('dry-run logs the deferral and the stop it would write, and writes neither'
 test('a refused pause or block is reported and does not take the session down', async () => {
   const paused = goalsService({ goal: view({ roundsStarted: 3 }), pauseThrows: true })
   const agentA = liveAgent('dsh-a')
-  const jobsA = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agentA }] })
+  const jobsA = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx: ctxA } = await mount({ goals: paused, jobs: jobsA })
   ctxA.emit('agent/status', { agent: agentA, status: 'idle' })
   assert.deepEqual(paused.pauses, [])
@@ -497,7 +623,7 @@ test('a session with no goal is ignored, and a failing goal read is contained', 
 test('a disposed agent is forgotten', async () => {
   const goals = goalsService({ goal: view({ roundsStarted: 3 }) })
   const agent = liveAgent('dsh-a')
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const { ctx } = await mount({ goals, jobs })
 
   ctx.emit('agent/status', { agent, status: 'idle' })
@@ -510,7 +636,7 @@ test('a disposed agent is forgotten', async () => {
   // The session id can be reused: a fresh state seeds and decides on its own,
   // with no memory of the deferral that belonged to the previous agent.
   goals.state.goal = { ...goals.state.goal, phase: 'active', activation: 'armed' }
-  jobs.state.jobs.push({ id: 'j2', status: 'running', owner: agent })
+  jobs.state.jobs.push({ id: 'j2', status: 'running', owner: 'dsh-a' })
   ctx.emit('agent/status', { agent: liveAgent('dsh-a'), status: 'idle' })
   assert.equal(goals.pauses.length, 2, 'the fresh session is tracked from scratch')
 })
@@ -520,7 +646,7 @@ test('a disposed agent is forgotten', async () => {
 test('createProgressGuard can be driven directly, and reports what it observed', () => {
   const agent = liveAgent('dsh-a')
   const goals = goalsService({ goal: view({ roundsStarted: 7 }) })
-  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: agent }] })
+  const jobs = jobsService({ jobs: [{ id: 'j1', status: 'running', owner: 'dsh-a' }] })
   const lines = []
   const ctx = {
     goals: goals.service,

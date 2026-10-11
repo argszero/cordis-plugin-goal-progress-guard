@@ -83,19 +83,45 @@ depends on one.
 - **Waiting for something that is not a job** (an approval, a subagent reporting through another
   channel) is not covered. The same pause/resume shape extends to it with a different trigger.
 
+## The seam, and the 0.2.0 repair
+
+Both dimensions program only against documented public surfaces, and the jobs half was written
+against a seam the harness has since consolidated. **0.1.0 was broken against every shipped
+harness** — it kept two assumptions the 2026-09-03 consolidation removed (upstream
+`07941fe5e2`, "consolidate the seam into JobSpec, VisibleJobs, and one event stream"):
+
+- **`jobs.list(caller)` takes the caller's session id, and `JobView.owner` is that session id** —
+  never the `Agent`. v0.1.0 passed the agent, so the owned-job comparison never matched.
+- **Settlements arrive on the registry's one event stream**, `jobs.events.subscribe(filter,
+  listener)`. The three listener families it replaced — `onJobDone`, `onJobsChanged`, `onOutput` —
+  no longer exist, so v0.1.0's settlement hook was never there to be called.
+
+The two compounded into the worst outcome this plugin can produce, and it was **not** inert:
+`list`'s unowned disjunct still admitted every unowned job, so a running shared job *did* pause the
+goal — and the pause could never be lifted, because the resume rode a hook that no longer exists.
+The goal was stranded. **0.2.0 repairs both halves**: the caller is the session id, and the
+settlement rides the documented event stream.
+
 ## Verification
 
-30 tests: the pure policy functions exhaustively, plus the guard driven through a **real cordis
+33 tests: the pure policy functions exhaustively, plus the guard driven through a **real cordis
 `Context`** against stubs that enforce the real services' rules — the CAS ref must be the revision
 that was read, `pause`/`block` require an `active` goal, `resume` refuses an already-armed goal, and
 the block reason must satisfy the harness validator copied verbatim from
 `packages/goal/goal/src/index.ts`. The suite carries a **control arm** (without the plugin, an idle
-agent with a running job is left alone) and a **listener-ordering test**, because the deferral only
-works if this plugin's `agent/status` listener runs before the driver's own.
+agent with a running job is left alone), a **listener-ordering test** — the deferral only works if
+this plugin's `agent/status` listener runs before the driver's own — and a **settlement test** that
+drives a real registry event through the subscription and checks the deferral actually lifts.
 
-16 mutation checks — the streak arithmetic and its boundary, the human-driven window, the activation gate, the unobservable-job
-handling on both sides, the `stopping` status, the listener ordering, the reason code, and the per-session counting — are each
-compiled and killed.
+The `jobs` stand-in enforces the **real** contract, and that is the point: the version that shipped
+compared `job.owner?.id === caller?.id`, mirroring the implementation's own mistake instead of the
+registry's rule, so 30 green tests certified a plugin that could not work. A fixture that agrees
+with the code proves nothing.
+
+10 mutation checks (`npm run test:defects`) — the job lookup's caller, the subscription, the event
+filter, the settlement path, and the unobservable-count handling — are each compiled and run
+against the suite; 9 are killed and 1 is recorded as equivalent, with the argument for why in the
+arm itself.
 
 ## Related
 
