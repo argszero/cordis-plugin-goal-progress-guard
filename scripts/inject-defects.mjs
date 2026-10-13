@@ -48,8 +48,8 @@ const ARMS = [
 
   ['list-passes-the-agent',
     'hands the registry the agent at the call site — the v0.1.0 defect verbatim',
-    '      unsettledJobs: unsettledJobs(sessionId),\n    }) === \'defer\') {',
-    '      unsettledJobs: unsettledJobs(agent as unknown as string),\n    }) === \'defer\') {'],
+    '      unsettledJobs: unsettledJobs(sessionId),\n      unsettledSubagents: unsettledSubagents(sessionId),\n      capped,',
+    '      unsettledJobs: unsettledJobs(agent as unknown as string),\n      unsettledSubagents: unsettledSubagents(sessionId),\n      capped,'],
 
   ['no-subscription',
     'installs the jobs service but never subscribes, so no settlement can arrive',
@@ -79,7 +79,7 @@ const ARMS = [
   ['settlement-lifts-every-session',
     'stops reading which session the settled job names',
     'if (owner !== undefined) {\n      releaseSession(owner)\n      return\n    }',
-    'if (owner !== undefined) {\n      for (const state of [...states.values()]) {\n        if (state.deferred !== undefined) release(state.deferred.agent)\n      }\n      return\n    }'],
+    'if (owner !== undefined) {\n      for (const state of [...states.values()]) {\n        if (state.deferred !== undefined) release(state.deferred.agent, false)\n      }\n      return\n    }'],
 
   ['settle-nobody',
     'drops the owner lookup on the settlement path',
@@ -95,6 +95,66 @@ const ARMS = [
     // distinction lives in the field's documented meaning, not in any behaviour
     // a test could observe. Recorded rather than dressed up as a kill.
     'equivalent'],
+
+  ['child-count-ignores-origin',
+    'counts any session naming this parent, so a fork is mistaken for delegated work',
+    "return header?.origin === 'subagent' && header.parentSession === parentSessionId",
+    'return header?.parentSession === parentSessionId'],
+
+  ['child-count-ignores-status',
+    'counts a passed-off child, so residency is treated as work in flight',
+    "if (agent.status !== 'running') return false\n",
+    ''],
+
+  ['child-count-ignores-parent',
+    'counts every running delegated child, whoever it belongs to',
+    '  return header?.origin === \'subagent\' && header.parentSession === parentSessionId',
+    "  return header?.origin === 'subagent'"],
+
+  ['no-child-release',
+    'never reconsiders a parent when a child goes quiescent: the goal stays paused',
+    '    guard.evaluate(payload.agent)\n    guard.childSettled(payload.agent)\n  }, { prepend: true })',
+    '    guard.evaluate(payload.agent)\n  }, { prepend: true })'],
+
+  ['no-disposed-release',
+    'never reconsiders a parent when a child is disposed',
+    '  on(\'agent/disposed\', (payload: { agent: unknown }) => {\n    guard.childSettled(payload.agent)\n    guard.forget(payload.agent)\n  })',
+    '  on(\'agent/disposed\', (payload: { agent: unknown }) => {\n    guard.forget(payload.agent)\n  })'],
+
+  ['no-agents-injection',
+    'installs no registry, so the child dimension is inert in every composition',
+    "  ctx.inject(['agents'], (agentsCtx) => {\n    guard.attachAgents((agentsCtx as unknown as { agents: AgentsLike }).agents)\n  })",
+    '  void 0'],
+
+  ['child-settlement-releases-itself',
+    "releases the child's own session instead of its parent's",
+    '    releaseSession(parent)',
+    '    releaseSession((agent as AgentLike).id)'],
+
+  ['no-deadline-armed',
+    'never arms the cap, so a stuck child holds the goal for as long as the composition lives',
+    'const maxDeferMs = config.maxDeferMs',
+    'const maxDeferMs = undefined as number | undefined'],
+
+  ['deadline-fires-on-settlement',
+    'treats an ordinary settlement as if the deadline had elapsed',
+    '    release(state.deferred.agent, false)',
+    '    release(state.deferred.agent, true)'],
+
+  ['cap-never-suppresses',
+    're-pauses immediately after the deadline released a round, so no round is ever taken',
+    "  if (observed.capped) return 'none'\n",
+    ''],
+
+  ['capped-rounds-are-judged',
+    'charges the deadline-released rounds to drift, stopping a goal whose work still runs',
+    '    if (state.capped) {\n      state.lastRoundsStarted = goal.roundsStarted\n      state.toolCallsInWindow = 0\n      return\n    }\n',
+    ''],
+
+  ['cap-never-clears',
+    'keeps suppressing deferrals after the work they waited for has drained',
+    '    if (pendingWork(observed) === 0) state.capped = false\n',
+    ''],
 ]
 
 const results = []

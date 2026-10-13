@@ -25,8 +25,10 @@ import {
   inject,
   isToolCallEvent,
   isUnsettled,
+  isRunningChild,
   mountLine,
   name,
+  pendingWork,
   resumeDecision,
 } from '../lib/index.js'
 
@@ -57,10 +59,10 @@ function view({ id = 'g1', revision = 4, phase = 'active', roundsStarted = 0, ac
 
 /**
  * A `goals` service stand-in that enforces the real service's rules.
- * @param options - the current goal view and optional forced failures.
+ * @param options - the current goal view, its owning agent id, and optional forced failures.
  * @returns the service, the calls it accepted, and the mutable goal holder.
  */
-function goalsService({ goal = undefined, getThrows = false, pauseThrows = false, blockThrows = false } = {}) {
+function goalsService({ goal = undefined, owner = undefined, getThrows = false, pauseThrows = false, blockThrows = false } = {}) {
   const pauses = []
   const resumes = []
   const blocks = []
@@ -74,6 +76,10 @@ function goalsService({ goal = undefined, getThrows = false, pauseThrows = false
     get(agent) {
       if (getThrows) throw new Error('goal "g1" is not the live agent instance')
       assert.equal(typeof agent, 'object', 'the goal service is always called with the live agent')
+      // A goal belongs to one live agent. Without this the fixture would hand
+      // every session the same goal, which is how a child's own quiescent edge
+      // could be mistaken for the parent's.
+      if (owner !== undefined && agent?.id !== owner) return undefined
       return current()
     },
     pause(agent, ref) {
@@ -190,9 +196,78 @@ function jobsService({ jobs = [] } = {}) {
   }
 }
 
-/** A minimal agent stand-in: the plugin only ever reads `agent.id` and `agent.session`. */
-function liveAgent(id) {
-  return { id, session: { id } }
+/** A minimal agent stand-in: the plugin only ever reads `agent.id`, `agent.status` and `agent.session`. */
+function liveAgent(id, { status = 'idle', header } = {}) {
+  return { id, status, session: { id, ...(header === undefined ? {} : { header }) } }
+}
+
+/**
+ * A delegated child's durable header, as `childSessionMeta` stamps it.
+ *
+ * Copied from `packages/subagent/subagent/src/child-agent.ts`: the parent's id
+ * under `parentSession`, and the coarse `origin: 'subagent'`. A **fork** writes
+ * `parentSession` too and leaves `origin` unset, which is exactly the
+ * difference the child predicate is built on.
+ */
+function childHeader(parentSession) {
+  return {
+    version: 4,
+    id: 'child',
+    createdAt: 0,
+    parentSession,
+    isSeeded: true,
+    origin: 'subagent',
+    delegationDepth: 1,
+  }
+}
+
+/** A forked session's durable header: lineage without delegation. */
+function forkHeader(parentSession) {
+  return { version: 4, id: 'fork', createdAt: 0, parentSession, isSeeded: true }
+}
+
+/**
+ * An `agents` service stand-in carrying **exactly the documented surface**.
+ *
+ * The real registry publishes `list()` — every live agent — and `get(id)`. This
+ * plugin calls `list` only, and it has to be the *live* registry rather than a
+ * durable projection: a session-query catalog entry carries no liveness at all,
+ * and the whole point of the child dimension is "is it running *now*". The
+ * fixture therefore offers no catalog method to reach for by mistake.
+ *
+ * @param agents - the live agents the registry would report.
+ * @returns the stub, with its mutable agent list.
+ */
+function agentsService(agents = []) {
+  const state = { agents: [...agents] }
+  return {
+    state,
+    service: { list: () => [...state.agents] },
+  }
+}
+
+/**
+ * A `schedule` stand-in that captures the armed callbacks instead of waiting.
+ *
+ * The mounted plugin arms real timers, which no test may depend on for a
+ * decision; this stand-in makes "did the deadline fire" a synchronous choice.
+ */
+function scheduler() {
+  const armed = []
+  return {
+    armed,
+    /** Fire every callback that is still armed, oldest first. */
+    fireAll() {
+      for (const entry of [...armed]) {
+        if (!entry.cancelled) entry.fire()
+      }
+    },
+    schedule(fire, delayMs) {
+      const entry = { fire, delayMs, cancelled: false }
+      armed.push(entry)
+      return () => { entry.cancelled = true }
+    },
+  }
 }
 
 /** A durable tool call, shaped as `Session.append` produces it. */
@@ -210,18 +285,21 @@ function userMessageEvent() {
  * `inject` travels with it (a hand-built mount that omits `inject` silently
  * drops the dependency).
  *
- * `jobs` is provided only when a test passes one, which is also how the
- * "composition without background jobs" case is exercised.
+ * `jobs` and `agents` are provided only when a test passes one, which is also
+ * how the "composition without background jobs / without an agent registry"
+ * cases are exercised: neither is required by `inject`, and both dimensions
+ * must be inert without them.
  *
  * @param options - plugin config and the stub services to provide.
  * @returns the mounted context and the stubs.
  */
-async function mount({ config = {}, goals, jobs } = {}) {
+async function mount({ config = {}, goals, jobs, agents } = {}) {
   const ctx = new Context()
   ctx.provide('goals', goals.service)
   if (jobs !== undefined) ctx.provide('jobs', jobs.service)
+  if (agents !== undefined) ctx.provide('agents', agents.service)
   await ctx.plugin({ name, inject, apply, Config }, config)
-  return { ctx, goals, jobs }
+  return { ctx, goals, jobs, agents }
 }
 
 // ------------------------------------------------------------- the pure policy
@@ -237,8 +315,16 @@ test('advanceBarrenStreak: only a settled round is judged, and only an empty one
     'one tool call is enough to be work')
 })
 
-test('deferDecision: only an armed, active goal with an observable pending job defers', () => {
-  const armed = { deferWhileJobsPending: true, phase: 'active', activation: 'armed', unsettledJobs: 1 }
+test('deferDecision: only an armed, active goal with observable pending work defers', () => {
+  const armed = {
+    deferWhileJobsPending: true,
+    deferWhileSubagentsPending: true,
+    phase: 'active',
+    activation: 'armed',
+    unsettledJobs: 1,
+    unsettledSubagents: 0,
+    capped: false,
+  }
   assert.equal(deferDecision(armed), 'defer')
   assert.equal(deferDecision({ ...armed, deferWhileJobsPending: false }), 'none', 'the dimension can be switched off')
   assert.equal(deferDecision({ ...armed, phase: 'paused' }), 'none', 'a paused goal has nothing to defer')
@@ -247,6 +333,26 @@ test('deferDecision: only an armed, active goal with an observable pending job d
   assert.equal(deferDecision({ ...armed, unsettledJobs: 0 }), 'none')
   assert.equal(deferDecision({ ...armed, unsettledJobs: undefined }), 'none',
     'an unobservable job count must never defer — that is the composition without a jobs service')
+  assert.equal(deferDecision({ ...armed, unsettledJobs: 0, unsettledSubagents: 1 }), 'defer',
+    'a running delegated child is the same reason to wait as a job')
+  assert.equal(deferDecision({ ...armed, unsettledJobs: 0, unsettledSubagents: 1, deferWhileSubagentsPending: false }), 'none',
+    'and that dimension can be switched off on its own')
+  assert.equal(deferDecision({ ...armed, unsettledJobs: 0, unsettledSubagents: undefined }), 'none',
+    'an unobservable child count never defers either')
+  assert.equal(deferDecision({ ...armed, capped: true }), 'none',
+    'a goal whose deadline already released a round is not waived away again')
+})
+
+test('pendingWork: a disabled or unobservable dimension is not work the guard is waiting for', () => {
+  const base = { deferWhileJobsPending: true, deferWhileSubagentsPending: true }
+  assert.equal(pendingWork({ ...base, unsettledJobs: 2, unsettledSubagents: 3 }), 5)
+  assert.equal(pendingWork({ ...base, unsettledJobs: undefined, unsettledSubagents: 3 }), 3,
+    'an unobservable count contributes nothing — it can never be why a deferral is held')
+  assert.equal(pendingWork({ ...base, unsettledJobs: 2, unsettledSubagents: undefined }), 2)
+  assert.equal(pendingWork({ ...base, unsettledJobs: undefined, unsettledSubagents: undefined }), 0)
+  assert.equal(pendingWork({ ...base, deferWhileJobsPending: false, unsettledJobs: 9, unsettledSubagents: 1 }), 1,
+    'a disabled dimension is not counted even when it is observable')
+  assert.equal(pendingWork({ deferWhileJobsPending: false, deferWhileSubagentsPending: false, unsettledJobs: 9, unsettledSubagents: 9 }), 0)
 })
 
 test('blockDecision: unset is unenforced, and a goal that is not active is never stopped', () => {
@@ -260,13 +366,20 @@ test('blockDecision: unset is unenforced, and a goal that is not active is never
 })
 
 test('resumeDecision: a goal moved by someone else is forgotten, not fought over', () => {
-  assert.equal(resumeDecision({ phase: 'paused', unsettledJobs: 0 }), 'resume')
-  assert.equal(resumeDecision({ phase: 'paused', unsettledJobs: 2 }), 'none')
-  assert.equal(resumeDecision({ phase: 'active', unsettledJobs: 0 }), 'forget', 'a human already resumed it')
-  assert.equal(resumeDecision({ phase: 'blocked', unsettledJobs: 0 }), 'forget')
-  assert.equal(resumeDecision({ phase: 'absent', unsettledJobs: 0 }), 'forget', 'the goal is gone')
-  assert.equal(resumeDecision({ phase: 'paused', unsettledJobs: undefined }), 'resume',
+  const base = { unsettledJobs: 0, unsettledSubagents: 0, deadlineReached: false }
+  assert.equal(resumeDecision({ ...base, phase: 'paused' }), 'resume')
+  assert.equal(resumeDecision({ ...base, phase: 'paused', unsettledJobs: 2 }), 'none')
+  assert.equal(resumeDecision({ ...base, phase: 'paused', unsettledSubagents: 1 }), 'none',
+    'a running child holds the deferral exactly as a job does')
+  assert.equal(resumeDecision({ ...base, phase: 'active' }), 'forget', 'a human already resumed it')
+  assert.equal(resumeDecision({ ...base, phase: 'blocked' }), 'forget')
+  assert.equal(resumeDecision({ ...base, phase: 'absent' }), 'forget', 'the goal is gone')
+  assert.equal(resumeDecision({ ...base, phase: 'paused', unsettledJobs: undefined }), 'resume',
     'an unobservable job count resumes: a deferral this plugin cannot lift would strand the goal')
+  assert.equal(resumeDecision({ ...base, phase: 'paused', unsettledSubagents: undefined }), 'resume',
+    'and so does an unobservable child count')
+  assert.equal(resumeDecision({ ...base, phase: 'paused', unsettledJobs: 5, unsettledSubagents: 5, deadlineReached: true }), 'resume',
+    'the deadline outranks work that is still observable: work which never ends would hold the goal forever')
 })
 
 test('isUnsettled: a job being killed has not settled', () => {
@@ -284,10 +397,13 @@ test('isToolCallEvent recognises exactly the durable tool call', () => {
 })
 
 test('mountLine states what the guard will do, including that it is inert', () => {
-  assert.match(mountLine({}), /deferWhileJobsPending=on, maxBarrenRounds=unset/)
-  assert.doesNotMatch(mountLine({}), /inert/, 'the default configuration does enforce the deferral dimension')
-  assert.match(mountLine({ deferWhileJobsPending: false, maxBarrenRounds: undefined }), /inert/)
+  assert.match(mountLine({}), /deferWhileJobsPending=on, deferWhileSubagentsPending=on, maxDeferMs=unset, maxBarrenRounds=unset/)
+  assert.doesNotMatch(mountLine({}), /inert/, 'the default configuration does enforce both deferral dimensions')
+  assert.doesNotMatch(mountLine({ deferWhileJobsPending: false }), /inert/,
+    'one disabled dimension is not an inert guard while the other still waits')
+  assert.match(mountLine({ deferWhileJobsPending: false, deferWhileSubagentsPending: false, maxBarrenRounds: undefined }), /inert/)
   assert.match(mountLine({ maxBarrenRounds: 3, dryRun: true }), /maxBarrenRounds=3 \(dry-run\)/)
+  assert.match(mountLine({ maxDeferMs: 60000 }), /maxDeferMs=60000/)
 })
 
 test('every reason code the plugin can emit is one the harness validator accepts', () => {
@@ -662,6 +778,7 @@ test('createProgressGuard can be driven directly, and reports what it observed',
     toolCallsInWindow: 2,
     barrenStreak: 0,
     deferred: false,
+    capped: false,
   }, 'an untouched session is empty, not guessed at')
 
   guard.evaluate(agent)
@@ -670,6 +787,7 @@ test('createProgressGuard can be driven directly, and reports what it observed',
     toolCallsInWindow: 0,
     barrenStreak: 0,
     deferred: true,
+    capped: false,
   }, 'goals.state.goal was left alone')
   assert.equal(goals.state.goal.phase, 'paused')
   assert.match(lines.join('\n'), /paused goal "g1"/)
@@ -677,4 +795,284 @@ test('createProgressGuard can be driven directly, and reports what it observed',
   guard.forget(agent)
   assert.equal(guard.observed('dsh-a').deferred, false)
   assert.equal(guard.observed('dsh-a').barrenStreak, 0)
+})
+
+// ------------------------------------------------- the delegated-child dimension
+
+test('isRunningChild counts exactly the running, delegated child of one parent', () => {
+  const running = (header, id = 'dsh-c') => liveAgent(id, { status: 'running', header })
+  assert.equal(isRunningChild(running(childHeader('dsh-a')), 'dsh-a'), true)
+  assert.equal(isRunningChild(running(childHeader('dsh-a'), 'dsh-c'), 'dsh-a'), true)
+  assert.equal(isRunningChild(liveAgent('dsh-c', { status: 'idle', header: childHeader('dsh-a') }), 'dsh-a'), false,
+    'a continuable child stays resident between turns — residency is not work in flight')
+  assert.equal(isRunningChild(running(childHeader('dsh-b')), 'dsh-a'), false,
+    "another session's child is not this session's work")
+  assert.equal(isRunningChild(running(forkHeader('dsh-a')), 'dsh-a'), false,
+    'a fork records parentSession too, and a fork is a sibling rather than work to wait for')
+  assert.equal(isRunningChild(running(undefined, 'dsh-a'), 'dsh-a'), false, 'a session is not its own child')
+  assert.equal(isRunningChild(running(undefined), 'dsh-a'), false, 'no header, no lineage')
+})
+
+test('a goal is paused while a delegated child runs, and resumed when that child stops', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const { ctx } = await mount({ goals, agents: agentsService([parent, child]) })
+
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  assert.equal(goals.pauses.length, 1, 'a running delegated child is the same reason to wait as a job')
+  assert.equal(goals.state.goal.phase, 'paused')
+
+  // The child's own quiescent edge is the release trigger, and it is the only
+  // timely one: a continuable child keeps its residency epoch open across turns.
+  child.status = 'idle'
+  ctx.emit('agent/status', { agent: child, status: 'idle' })
+  assert.equal(goals.resumes.length, 1, 'the child stopping running is what the parent was waiting for')
+  assert.equal(goals.state.goal.phase, 'active')
+})
+
+test('a goal stays paused until the last of several children stops', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const first = liveAgent('dsh-c1', { status: 'running', header: childHeader('dsh-a') })
+  const second = liveAgent('dsh-c2', { status: 'running', header: childHeader('dsh-a') })
+  const { ctx } = await mount({ goals, agents: agentsService([parent, first, second]) })
+
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  assert.equal(goals.pauses.length, 1)
+
+  first.status = 'idle'
+  ctx.emit('agent/status', { agent: first, status: 'idle' })
+  assert.deepEqual(goals.resumes, [], 'one child left is still something to wait for')
+  assert.equal(goals.state.goal.phase, 'paused')
+
+  second.status = 'idle'
+  ctx.emit('agent/status', { agent: second, status: 'idle' })
+  assert.equal(goals.resumes.length, 1)
+})
+
+test('a disposed child is no longer work in flight', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const agents = agentsService([parent, child])
+  const { ctx } = await mount({ goals, agents })
+
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  assert.equal(goals.pauses.length, 1)
+
+  agents.state.agents = [parent]
+  ctx.emit('agent/disposed', { agent: child })
+  assert.equal(goals.resumes.length, 1, 'work that no longer exists is not work to wait for')
+})
+
+test("a child's own deferral is judged on its own goal, not its parent's", async () => {
+  const parentGoals = goalsService({ goal: view({ id: 'gp', roundsStarted: 3 }), owner: 'dsh-a' })
+  const childGoals = goalsService({ goal: view({ id: 'gc', roundsStarted: 1 }), owner: 'dsh-c' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const grandchild = liveAgent('dsh-g', { status: 'running', header: childHeader('dsh-c') })
+  const agents = agentsService([parent, child, grandchild])
+
+  // One service, two owners: the goals stub dispatches on the live agent.
+  const both = {
+    service: {
+      get: (agent) => parentGoals.service.get(agent) ?? childGoals.service.get(agent),
+      pause: (agent, ref) => (agent.id === 'dsh-c' ? childGoals.service : parentGoals.service).pause(agent, ref),
+      resume: (agent, ref) => (agent.id === 'dsh-c' ? childGoals.service : parentGoals.service).resume(agent, ref),
+      block: (agent, ref, reason) => (agent.id === 'dsh-c' ? childGoals.service : parentGoals.service).block(agent, ref, reason),
+    },
+  }
+
+  const { ctx } = await mount({ goals: both, agents })
+
+  // The parent's own quiescent edge defers it on the child that is still
+  // running. This must come first: the child's edge below is what releases it.
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  assert.equal(parentGoals.pauses.length, 1, 'the parent waits for the child')
+  assert.deepEqual(childGoals.pauses, [], 'and the child, still running, is not consulted yet')
+
+  // One edge, two independent judgements: the child is evaluated against its
+  // OWN goal (it has a running grandchild), and its own stop releases the
+  // parent, whose work is now over.
+  child.status = 'idle'
+  ctx.emit('agent/status', { agent: child, status: 'idle' })
+  assert.equal(childGoals.pauses.length, 1, 'the child waits for its own child')
+  assert.equal(parentGoals.resumes.length, 1, 'and the child stopping frees the parent')
+  assert.equal(parentGoals.state.goal.phase, 'active')
+  assert.equal(childGoals.state.goal.phase, 'paused')
+
+  grandchild.status = 'idle'
+  ctx.emit('agent/status', { agent: grandchild, status: 'idle' })
+  assert.equal(childGoals.resumes.length, 1, 'the grandchild stops, so the child may move again')
+  assert.equal(parentGoals.resumes.length, 1, 'and the parent is not touched: it is not waiting on the grandchild')
+})
+
+test('without an agents service the child dimension is inert and the rest still works', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const { ctx } = await mount({ config: { maxBarrenRounds: 2 }, goals })
+
+  ctx.emit('agent/status', { agent: parent, status: 'idle' }) // seeds the window
+  for (const started of [4, 5]) {
+    goals.state.goal = { ...goals.state.goal, roundsStarted: started }
+    ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  }
+  assert.deepEqual(goals.pauses, [], 'a child the guard cannot see is not work it waits for')
+  assert.equal(goals.blocks.length, 1, 'and the no-progress dimension is untouched')
+
+  ctx.emit('agent/status', { agent: child, status: 'idle' })
+  assert.deepEqual(goals.resumes, [], 'a child edge has nothing to release when nothing was deferred')
+})
+
+test('the plugin touches only members the agents service actually publishes', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const agents = agentsService([parent, child])
+
+  // Property reads are what a removed *method* looks like from the outside, so
+  // the read itself is the only thing observable here. The registry publishes
+  // `list()` and `get(id)`; this dimension needs the live list and nothing else.
+  const touched = new Set()
+  const watched = new Proxy(agents.service, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string') touched.add(prop)
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+
+  const ctx = new Context()
+  ctx.provide('goals', goals.service)
+  ctx.provide('agents', watched)
+  await ctx.plugin({ name, inject, apply, Config }, {})
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+
+  assert.deepEqual([...touched].sort(), ['list'])
+  assert.equal(goals.pauses.length, 1)
+})
+
+// ------------------------------------------------------------- the deferral cap
+
+test('maxDeferMs lifts a deferral nothing else can lift, and stops deferring until the work drains', () => {
+  const agent = liveAgent('dsh-a')
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const agents = agentsService([agent, child])
+  const sched = scheduler()
+  const lines = []
+  const guard = createProgressGuard(
+    { goals: goals.service, logger: { info: (line) => lines.push(line), warn: (line) => lines.push(line) }, schedule: sched.schedule },
+    { maxDeferMs: 60000, maxBarrenRounds: 1 },
+  )
+  guard.attachAgents(agents.service)
+
+  guard.evaluate(agent)
+  assert.equal(goals.pauses.length, 1)
+  assert.equal(sched.armed.length, 1, 'the pause and its deadline are written together')
+  assert.equal(sched.armed[0].delayMs, 60000)
+
+  sched.fireAll() // the deadline elapses; the child is still running
+  assert.equal(goals.resumes.length, 1, 'a deadline that never fires is not a deadline')
+  assert.equal(guard.observed('dsh-a').capped, true)
+  assert.equal(sched.armed[0].cancelled, true, 'lifting the deferral disarms its own deadline')
+
+  // The rounds from here are admitted by the guard's own deadline, so they are
+  // not drift, and they must not be deferred again either — re-pausing would
+  // withdraw the very round the deadline just released.
+  for (const started of [4, 5, 6]) {
+    goals.state.goal = { ...goals.state.goal, roundsStarted: started }
+    guard.evaluate(agent)
+  }
+  assert.deepEqual(goals.blocks, [], 'charging these rounds would stop a goal whose work is still running')
+  assert.equal(goals.pauses.length, 1)
+
+  // The work finally drains, and the cap goes with it.
+  agents.state.agents = [agent]
+  guard.evaluate(agent)
+  assert.equal(guard.observed('dsh-a').capped, false, 'the cap lasts only as long as the work it was holding for')
+
+  goals.state.goal = { ...goals.state.goal, roundsStarted: 7 }
+  guard.evaluate(agent)
+  assert.equal(goals.blocks.length, 1, 'once the work is gone, the ordinary rules are back')
+})
+
+test('an unset maxDeferMs arms nothing: the deferral is held for as long as its work is observable', () => {
+  const agent = liveAgent('dsh-a')
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const sched = scheduler()
+  const guard = createProgressGuard(
+    { goals: goals.service, logger: { info: () => {}, warn: () => {} }, schedule: sched.schedule },
+    {},
+  )
+  guard.attachAgents(agentsService([agent, child]).service)
+
+  guard.evaluate(agent)
+  assert.equal(goals.pauses.length, 1)
+  assert.deepEqual(sched.armed, [], 'the default is the pre-0.3.0 behaviour: no clock, no cap')
+})
+
+test('without a scheduler a configured cap degrades to the unbounded deferral rather than throwing', () => {
+  const agent = liveAgent('dsh-a')
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const guard = createProgressGuard({ goals: goals.service, logger: { info: () => {}, warn: () => {} } }, { maxDeferMs: 60000 })
+  guard.attachAgents(agentsService([agent, child]).service)
+
+  guard.evaluate(agent)
+  assert.equal(goals.pauses.length, 1, 'the guard is harness-free, so a clock is not something it can require')
+  assert.equal(goals.resumes.length, 0)
+})
+
+test('a settlement that arrives before the deadline lifts without capping', () => {
+  const agent = liveAgent('dsh-a')
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const agents = agentsService([agent, child])
+  const sched = scheduler()
+  const guard = createProgressGuard(
+    { goals: goals.service, logger: { info: () => {}, warn: () => {} }, schedule: sched.schedule },
+    { maxDeferMs: 60000 },
+  )
+  guard.attachAgents(agents.service)
+
+  guard.evaluate(agent)
+  agents.state.agents = [agent]
+  guard.childSettled(child)
+  assert.equal(goals.resumes.length, 1, 'the work finished on its own, well inside the deadline')
+  assert.equal(guard.observed('dsh-a').capped, false, 'only a deadline may cap the deferral')
+  assert.equal(sched.armed[0].cancelled, true, 'and the deadline it no longer needs is disarmed')
+
+  sched.fireAll()
+  assert.equal(goals.resumes.length, 1, 'a disarmed deadline cannot act twice')
+})
+
+test('the mounted guard arms its deadline on a real timer', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const { ctx } = await mount({ config: { maxDeferMs: 20 }, goals, agents: agentsService([parent, child]) })
+
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  assert.equal(goals.pauses.length, 1)
+  assert.deepEqual(goals.resumes, [], 'nothing has elapsed yet')
+
+  await new Promise((resolve) => { setTimeout(resolve, 80) })
+  assert.equal(goals.resumes.length, 1, 'the mount wires the scheduler, so the deadline really is a timer')
+})
+
+test('a disposed deferred agent leaves no armed deadline behind', async () => {
+  const goals = goalsService({ goal: view({ roundsStarted: 3 }), owner: 'dsh-a' })
+  const parent = liveAgent('dsh-a')
+  const child = liveAgent('dsh-c', { status: 'running', header: childHeader('dsh-a') })
+  const { ctx } = await mount({ config: { maxDeferMs: 20 }, goals, agents: agentsService([parent, child]) })
+
+  ctx.emit('agent/status', { agent: parent, status: 'idle' })
+  assert.equal(goals.pauses.length, 1)
+  ctx.emit('agent/disposed', { agent: parent })
+
+  await new Promise((resolve) => { setTimeout(resolve, 80) })
+  assert.deepEqual(goals.resumes, [], 'a timer for a session nothing remembers must not fire at it')
 })

@@ -20,23 +20,34 @@
  * - **drift**: #1831 recorded 160 near-identical rounds before a human stopped
  *   it.
  *
- * This plugin adds the two missing judgements, from outside the driver, with no
+ * This plugin adds the missing judgements, from outside the driver, with no
  * core change:
  *
- * 1. **Pending work defers the loop** (`deferWhileJobsPending`, default on).
- *    At the quiescent edge, if the agent still owns an unsettled job, the goal
- *    is *paused* rather than allowed to take another round; when the last job
- *    settles, the goal is *resumed*. The rounds in between are the ones the
- *    agent would otherwise have spent talking to itself while waiting.
+ * 1. **Pending work defers the loop** (`deferWhileJobsPending` and
+ *    `deferWhileSubagentsPending`, both default on). At the quiescent edge, if
+ *    the agent still owns an unsettled job, or still has a delegated child
+ *    running, the goal is *paused* rather than allowed to take another round;
+ *    when the last of them finishes, the goal is *resumed*. The rounds in
+ *    between are the ones the agent would otherwise have spent talking to
+ *    itself while waiting. Discussion #9607 is the delegated-child half: an
+ *    orchestrator whose only outstanding work is a running subagent looks
+ *    exactly like a finished agent at the `idle` signal.
  * 2. **A round that produced nothing is counted** (`maxBarrenRounds`).
  *    Consecutive settled rounds with no `tool/call` in the window stop the goal
  *    with a durable `no-progress` reason. This is the cheapest form of the
  *    "no progress" rule, and it needs no extra model call — which is the point
  *    Codex's goal cookbook makes when it suppresses a continuation turn that
  *    made no tool call.
+ * 3. **A deferral has a deadline** (`maxDeferMs`, unset by default). A pause
+ *    that nothing can lift is the one outcome worse than an early round, so
+ *    when a deadline is configured a deferral that is still held at that
+ *    deadline is lifted, the round is admitted, and the guard stops deferring
+ *    that goal until its pending set drains. Without it, work that never
+ *    finishes — a job whose producer hung, a child stuck mid-turn — holds the
+ *    goal paused indefinitely.
  *
- * The two are deliberately separable: an evaluation planner is a different
- * question, and neither dimension here depends on one.
+ * The three are deliberately separable: an evaluation planner is a different
+ * question, and no dimension here depends on another.
  *
  * Honest boundaries, all of them:
  *
@@ -45,23 +56,42 @@
  *   terminal until a human resumes it and carries a durable reason. A stall in
  *   a live loop is a deferral; only a run of barren rounds is a verdict.
  * - **The deferral is a snapshot, not a subscription.** It is re-evaluated at
- *   each quiescent edge and on each job settlement. A job started by something
- *   other than this agent's turn (another session's work, a human's shell) does
- *   not defer anything.
+ *   each quiescent edge, at each job settlement, when a delegated child stops
+ *   running, and when one is disposed. A job started by something other
+ *   than this agent's turn (another session's work, a human's shell) does not
+ *   defer anything.
  * - **`stopping` counts as unsettled.** A job being killed has not settled; it
  *   still reports `finishedAt === undefined`.
- * - **No jobs service, no deferral.** The jobs service is injected optionally;
- *   with no `jobs` in the composition the deferral dimension is inert and the
- *   no-progress dimension still works.
+ * - **No jobs service, no job deferral; no agents registry, no child
+ *   deferral.** Both services are injected optionally; with neither in the
+ *   composition the deferral dimension is inert and the no-progress dimension
+ *   still works.
+ * - **A delegated child counts while it is *running*.** The count is a live
+ *   read of the agent registry (`agents.list()`), filtered to entries whose
+ *   durable session header names this session as parent and whose `origin` is
+ *   `subagent` — so a child that is resident but between turns does not hold
+ *   the goal, and a forked session is not mistaken for delegated work. A child
+ *   a provider runs **out of process** has no live `Agent` here at all, so it
+ *   cannot be counted; the dimension is inert for it and rounds are admitted
+ *   as they were before this dimension existed.
  * - **The no-progress window is the span between two quiescent edges**, and a
  *   window in which no round was admitted (because the human was driving) does
  *   not count toward the streak. Tool calls are read from the durable session
  *   log, so the rule is replayable rather than live-only.
- * - **It does not interrupt work in flight.** Both decisions are taken when the
+ * - **A round admitted after a capped deferral is not judged.** While the cap
+ *   has lifted and the work is still pending, the guard neither defers nor
+ *   counts a barren round: the round was admitted by the guard's own deadline,
+ *   not chosen by a drifting loop, and charging drift to it would stop a goal
+ *   whose work is demonstrably still running. The effect of setting both
+ *   `maxDeferMs` and `maxBarrenRounds` is therefore that the streak is paused
+ *   for as long as the cap is in force — set `maxBarrenRounds` as if the cap
+ *   were absent.
+ * - **It does not interrupt work in flight.** Every decision is taken when an
  *   agent is quiescent. A running turn is never cancelled by this plugin.
- * - **Waiting for something that is not a job** (an approval, a subagent that
- *   reports through another channel) is not covered; the same pause/resume
- *   shape extends to it, with a different trigger.
+ * - **Waiting for something that is neither a job nor a subagent** (an
+ *   approval, an out-of-process worker reporting through another channel) is
+ *   still not covered; the same pause/resume shape extends to it, with a
+ *   different trigger.
  *
  * ## The seam it reads, and the 0.2.0 repair
  *
@@ -85,6 +115,31 @@
  * stranded goal {@link resumeDecision} calls worse than lifting early. 0.2.0
  * repairs both: the caller is the session id, and the settlement rides the
  * documented event stream.
+ *
+ * ## The seam the child dimension reads (0.3.0)
+ *
+ * The delegated-child dimension is a **live read**, not an event-paired
+ * counter, for the reason the jobs dimension is: a counter that has to be kept
+ * in step with two edge types drifts, and a drifted count either never defers
+ * or never lifts. What it reads:
+ *
+ * - `ctx.agents.list()` — every live `Agent`, each exposing `id` and `status`
+ *   (`'idle' | 'running'`).
+ * - `agent.session.header` — the durable `SessionHeader`, whose `parentSession`
+ *   and `origin: 'subagent'` are what `childSessionMeta` stamps on every child
+ *   a provider composes in process.
+ *
+ * Settlements are **triggers to re-read**, never sources of truth. The trigger
+ * is the child's **own** `agent/status` at `idle`, and its `agent/disposed`:
+ * both carry the child `Agent`, whose durable header already names its parent,
+ * so the release is attributed without pairing a run id and without looking a
+ * session up. `subagent/end` is deliberately not used — its payload names a run
+ * and not a parent, so attribution would have to go through a lookup that races
+ * the child's own disposal, and a continuable child keeps its residency epoch
+ * open across turns: a child that finished the turn its parent was waiting on
+ * may not publish a terminal edge for a long time, while its `status` stops
+ * being `running` immediately. The child's own edge is both the cheaper and the
+ * more timely trigger.
  *
  * @packageDocumentation
  */
@@ -112,9 +167,28 @@ export interface Config {
   /**
    * Pause an active goal while the agent still owns an unsettled job, and
    * resume it when the last one settles. Defaults to `true`; set `false` to
-   * keep only the no-progress dimension.
+   * keep only the other dimensions.
    */
   deferWhileJobsPending?: boolean
+  /**
+   * Pause an active goal while the agent still has a delegated child running,
+   * and resume it when the last one stops running. Defaults to `true`; set
+   * `false` to keep only the other dimensions.
+   */
+  deferWhileSubagentsPending?: boolean
+  /**
+   * How long one deferral may be held before the guard lifts it and admits the
+   * round anyway. Unset — the default — means a deferral is held for as long as
+   * its work is observable, which is the behaviour every release before 0.3.0
+   * had.
+   *
+   * **This is a safety valve, not a heartbeat.** It exists for work that never
+   * finishes: a job whose producer hung, a child stuck mid-turn. A round spent
+   * waiting is exactly what the deferral exists to avoid, so a value here is a
+   * bound on the damage rather than a cadence — a few minutes above the longest
+   * legitimate wait is the intended setting.
+   */
+  maxDeferMs?: number
   /** Log the stop or deferral this policy would perform instead of performing it. */
   dryRun?: boolean
 }
@@ -123,6 +197,8 @@ export interface Config {
 export const Config: z<Config> = z.object({
   maxBarrenRounds: z.number().step(1).min(1).required(false),
   deferWhileJobsPending: z.boolean().default(true),
+  deferWhileSubagentsPending: z.boolean().default(true),
+  maxDeferMs: z.number().step(1).min(1).required(false),
   dryRun: z.boolean().default(false),
 })
 
@@ -153,31 +229,66 @@ export function advanceBarrenStreak(window: RoundWindow): number {
 
 /** The quantities the deferral decision is taken from. */
 export interface DeferObservation {
-  /** Whether the deferral dimension is enabled for this deployment. */
+  /** Whether the job dimension is enabled for this deployment. */
   readonly deferWhileJobsPending: boolean
+  /** Whether the delegated-child dimension is enabled for this deployment. */
+  readonly deferWhileSubagentsPending: boolean
   /** Durable goal phase. */
   readonly phase: string
   /** Live goal activation. */
   readonly activation: string
   /** Unsettled jobs owned by this agent, or `undefined` when not observable. */
   readonly unsettledJobs: number | undefined
+  /** Delegated children still running, or `undefined` when not observable. */
+  readonly unsettledSubagents: number | undefined
+  /**
+   * Whether a deferral of this goal was already lifted by its deadline. A
+   * capped episode is not deferred again — re-pausing would withdraw the very
+   * round the deadline just released, every round, and the goal would never
+   * take one.
+   */
+  readonly capped: boolean
+}
+
+/** The subset of {@link DeferObservation} the pending count is read from. */
+export type PendingObservation = Pick<DeferObservation,
+  'deferWhileJobsPending' | 'deferWhileSubagentsPending' | 'unsettledJobs' | 'unsettledSubagents'>
+
+/**
+ * The work one observation counts, in the guard's own terms.
+ *
+ * A disabled dimension contributes nothing, and an **unobservable** one
+ * contributes nothing either — neither can be the reason a deferral is held,
+ * which is why the two are one number rather than two: one unsettled job and
+ * one running child are the same reason to wait. This is also the number that
+ * decides whether a capped episode has drained.
+ *
+ * @param observed - the counts read for one agent.
+ * @returns how many pieces of work this guard is waiting for, never negative.
+ */
+export function pendingWork(observed: PendingObservation): number {
+  const jobs = observed.deferWhileJobsPending ? observed.unsettledJobs ?? 0 : 0
+  const children = observed.deferWhileSubagentsPending ? observed.unsettledSubagents ?? 0 : 0
+  return jobs + children
 }
 
 /**
  * Decide whether the goal should be paused to wait for work already running.
  *
  * Only an `active`, `armed` goal is deferred — a paused or blocked goal has
- * nothing to defer — and an unobservable job count never defers, so a
- * composition without the jobs service behaves exactly as it did before.
+ * nothing to defer — and an unobservable count never defers, so a composition
+ * without the jobs or agents service behaves exactly as it did before the
+ * corresponding dimension existed. A goal whose deadline already lifted one
+ * deferral is not deferred again until its work drains, because re-pausing
+ * would withdraw the very round the deadline released.
  *
  * @param observed - the quantities read for one agent.
  * @returns `defer` when the goal should wait.
  */
 export function deferDecision(observed: DeferObservation): 'defer' | 'none' {
-  if (!observed.deferWhileJobsPending) return 'none'
   if (observed.phase !== 'active' || observed.activation !== 'armed') return 'none'
-  if (observed.unsettledJobs === undefined || observed.unsettledJobs === 0) return 'none'
-  return 'defer'
+  if (observed.capped) return 'none'
+  return pendingWork(observed) > 0 ? 'defer' : 'none'
 }
 
 /** The quantities the no-progress decision is taken from. */
@@ -219,27 +330,39 @@ export interface ResumeObservation {
   readonly phase: string
   /** Unsettled jobs owned by this agent, or `undefined` when not observable. */
   readonly unsettledJobs: number | undefined
+  /** Delegated children still running, or `undefined` when not observable. */
+  readonly unsettledSubagents: number | undefined
+  /**
+   * Whether this deferral has been held at least as long as `maxDeferMs`.
+   * Always `false` when no deadline is configured.
+   */
+  readonly deadlineReached: boolean
 }
 
 /**
  * Decide whether a goal this plugin paused should be resumed.
  *
- * Two asymmetries are deliberate:
+ * Three asymmetries are deliberate:
  *
  * - a goal that is no longer `paused` was moved by someone else (a human, or
  *   the round-limit block), so the record is simply forgotten rather than
  *   fought over;
- * - an unobservable job count resumes rather than stays paused. Staying paused
- *   is the failure that strands the goal — the plugin's own pause must always
- *   be releasable, and a deferral that cannot be lifted is worse than one that
- *   lifts early.
+ * - an unobservable pending count resumes rather than stays paused. Staying
+ *   paused is the failure that strands the goal — the plugin's own pause must
+ *   always be releasable, and a deferral that cannot be lifted is worse than
+ *   one that lifts early;
+ * - a deferral held past its deadline is lifted even though its work is still
+ *   observable, for the same reason: observable work that never finishes would
+ *   otherwise hold the goal for as long as the composition lives.
  *
  * @param observed - the quantities read for one agent.
  * @returns `resume`, `forget`, or `none`.
  */
 export function resumeDecision(observed: ResumeObservation): ResumeDecision {
   if (observed.phase !== 'paused') return 'forget'
+  if (observed.deadlineReached) return 'resume'
   if ((observed.unsettledJobs ?? 0) > 0) return 'none'
+  if ((observed.unsettledSubagents ?? 0) > 0) return 'none'
   return 'resume'
 }
 
@@ -337,15 +460,85 @@ export interface JobsLike {
 }
 
 /**
+ * One live agent as the registry exposes it — the `Agent` subset read here.
+ *
+ * `status` is `'idle' | 'running'`, mirrored on every `agent/status`
+ * transition. `session.header` is the durable, deep-frozen `SessionHeader`; a
+ * child composed by a provider in process carries `parentSession` (its
+ * delegating parent) and `origin: 'subagent'` there.
+ */
+export interface AgentLike {
+  /** The shared agent/session id. */
+  readonly id: string
+  /** Current lifecycle state. */
+  readonly status: string
+  /** The live session this agent drives. */
+  readonly session?: {
+    readonly header?: {
+      /** Coarse product classification: `'subagent'` for a delegated child. */
+      readonly origin?: unknown
+      /** The session this one was forked from *or* dispatched by, if any. */
+      readonly parentSession?: unknown
+    }
+  }
+}
+
+/** The agent registry surface this plugin uses, all of it documented and public. */
+export interface AgentsLike {
+  /** All live agents, in registration order. */
+  list(): AgentLike[]
+}
+
+/**
+ * Whether one live agent is a delegated child of `parentSessionId` that is
+ * still running.
+ *
+ * The three conditions are each load-bearing:
+ *
+ * - `origin === 'subagent'` keeps a **forked** session out of the count. A fork
+ *   records `parentSession` too, and a fork is a sibling, not work the parent
+ *   is waiting on.
+ * - `status === 'running'` is what makes this a count of *work in flight*.
+ *   A continuable child stays resident between turns; counting residency rather
+ *   than execution would hold the goal from the moment a child was created
+ *   until it was closed, which is not a wait.
+ * - the parent comparison is the durable dispatch lineage `childSessionMeta`
+ *   stamps on every child a provider composes in process.
+ *
+ * @param agent - one live agent.
+ * @param parentSessionId - the session whose delegated work is being counted.
+ * @returns whether this agent counts as that session's running child.
+ */
+export function isRunningChild(agent: AgentLike, parentSessionId: string): boolean {
+  if (agent.id === parentSessionId) return false
+  if (agent.status !== 'running') return false
+  const header = agent.session?.header
+  return header?.origin === 'subagent' && header.parentSession === parentSessionId
+}
+
+/**
  * The ambient surface the guard needs, injected so it can be driven in tests.
  *
- * The jobs service is deliberately *not* read from here: reading a service that
- * was not declared in `inject` throws, and the jobs service is optional by
- * design, so it is installed through {@link ProgressGuard.attachJobs} instead.
+ * The jobs and agents services are deliberately *not* read from here: reading a
+ * service that was not declared in `inject` throws, and both are optional by
+ * design, so they are installed through {@link ProgressGuard.attachJobs} and
+ * {@link ProgressGuard.attachAgents} instead.
  */
 export interface GuardContext {
   readonly goals: GoalsLike
   readonly logger: { info(message: string): void; warn(message: string): void }
+  /**
+   * Arm one one-shot timer, returning the cancel.
+   *
+   * Supplied by {@link apply}, which owns the mount's lifetime and clears
+   * anything still armed when the plugin unloads. It is **optional**: a
+   * harness-free caller may drive the guard without a clock, and then a
+   * configured `maxDeferMs` has nothing to fire on — the deferral is held
+   * exactly as it was before 0.3.0, which is a degradation a caller who set the
+   * option must be told about rather than a silent one (the mount always
+   * supplies it).
+   */
+  readonly schedule?: (fire: () => void, delayMs: number) => () => void
 }
 
 /** What the guard currently believes about one session. */
@@ -358,6 +551,8 @@ export interface ObservedProgress {
   readonly barrenStreak: number
   /** Whether this plugin is currently holding the goal paused. */
   readonly deferred: boolean
+  /** Whether a deferral of this goal was lifted by its deadline and its work has not drained. */
+  readonly capped: boolean
 }
 
 /** The progress guard, usable without a harness. */
@@ -374,12 +569,29 @@ export interface ProgressGuard {
    * see, so it can lift any deferral.
    */
   jobSettled(owner: string | undefined): void
+  /**
+   * Reconsider a parent's deferral after one of its delegated children stopped.
+   *
+   * The argument is the child, so its durable header attributes the release;
+   * anything that is not a delegated child is ignored, which makes this safe to
+   * call on every quiescent edge.
+   */
+  childSettled(agent: unknown): void
   /** Drop everything remembered about one agent. */
   forget(agent: unknown): void
   /** Install the optional jobs service once it becomes available. */
   attachJobs(jobs: JobsLike): void
+  /** Install the optional agent registry once it becomes available. */
+  attachAgents(agents: AgentsLike): void
   /** What the guard believes about one session, for tests and reporting. */
   observed(sessionId: string): ObservedProgress
+}
+
+/** One applied deferral: the goal it paused, and how to stop waiting early. */
+interface Deferral {
+  readonly agent: unknown
+  /** Cancel the deadline timer, when one was armed. */
+  readonly disarm: (() => void) | undefined
 }
 
 /** Per-session bookkeeping. */
@@ -387,7 +599,9 @@ interface Tracked {
   lastRoundsStarted: number | undefined
   toolCallsInWindow: number
   barrenStreak: number
-  deferred: { agent: unknown; goalId: string } | undefined
+  deferred: Deferral | undefined
+  /** Set when a deferral was lifted by its own deadline rather than by its work. */
+  capped: boolean
 }
 
 /** Human-readable unexpected values for logs. */
@@ -423,7 +637,15 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
    */
   let jobs: JobsLike | undefined
 
-  const deferEnabled = config.deferWhileJobsPending !== false
+  /**
+   * The agent registry, once installed. Optional for the same reason `jobs`
+   * is, and by the same mechanism.
+   */
+  let agents: AgentsLike | undefined
+
+  const deferJobsEnabled = config.deferWhileJobsPending !== false
+  const deferChildrenEnabled = config.deferWhileSubagentsPending !== false
+  const maxDeferMs = config.maxDeferMs
   const maxBarrenRounds = config.maxBarrenRounds
   const dryRun = config.dryRun === true
 
@@ -435,6 +657,7 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
       toolCallsInWindow: 0,
       barrenStreak: 0,
       deferred: undefined,
+      capped: false,
     }
     states.set(sessionId, fresh)
     return fresh
@@ -469,6 +692,38 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     }
   }
 
+  /**
+   * Delegated children of this session that are still running, or `undefined`
+   * when the registry is not installed.
+   *
+   * This is a live read rather than a counter kept in step with two edges, for
+   * the reason the jobs dimension is: a count that has to agree with a start
+   * and an end drifts, and a drifted count either never defers or never lifts.
+   */
+  function unsettledSubagents(sessionId: string): number | undefined {
+    if (agents === undefined) return undefined
+    try {
+      return agents.list().filter(candidate => isRunningChild(candidate, sessionId)).length
+    } catch (error: unknown) {
+      ctx.logger.warn(`goal-progress-guard: could not read the live agents: ${renderThrown(error)}`)
+      return undefined
+    }
+  }
+
+  /** One agent's count of work this deployment waits for, and the goal it belongs to. */
+  function observe(agent: unknown, goal: GoalViewLike, capped: boolean): DeferObservation {
+    const sessionId = sessionIdOf(agent) ?? ''
+    return {
+      deferWhileJobsPending: deferJobsEnabled,
+      deferWhileSubagentsPending: deferChildrenEnabled,
+      phase: goal.phase,
+      activation: goal.activation,
+      unsettledJobs: unsettledJobs(sessionId),
+      unsettledSubagents: unsettledSubagents(sessionId),
+      capped,
+    }
+  }
+
   const refOf = (goal: GoalViewLike): GoalRefLike => ({ id: goal.id, revision: goal.revision })
 
   function observeToolCall(sessionId: string): void {
@@ -480,29 +735,38 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     if (sessionId === undefined) return
     const goal = readGoal(agent)
     if (goal === undefined) {
-      states.delete(sessionId)
+      clearState(sessionId)
       return
     }
     const state = stateOf(sessionId)
+    const observed = observe(agent, goal, state.capped)
+
+    // A cap lasts only as long as the work it was holding for. Once that work
+    // is gone the goal is judged by the ordinary rules again.
+    if (pendingWork(observed) === 0) state.capped = false
 
     // 1. Work already running outranks another round. Taken before the streak
     //    bookkeeping: a round that ended in order to wait was not barren, so a
     //    deferral must not advance the streak.
-    if (deferDecision({
-      deferWhileJobsPending: deferEnabled,
-      phase: goal.phase,
-      activation: goal.activation,
-      unsettledJobs: unsettledJobs(sessionId),
-    }) === 'defer') {
-      if (dryRun) ctx.logger.info(`goal-progress-guard: would pause goal "${goal.id}" while its background jobs run (dry-run)`)
-      else if (pauseGoal(agent, goal)) state.deferred = { agent, goalId: goal.id }
+    if (deferDecision({ ...observed, capped: state.capped }) === 'defer') {
+      writeDeferral(agent, goal, sessionId, state)
       state.barrenStreak = 0
       state.lastRoundsStarted = goal.roundsStarted
       state.toolCallsInWindow = 0
       return
     }
 
-    // 2. A window is only judged once a previous edge defines it: on first
+    // 2. A round the guard's own deadline admitted is not drift. The round was
+    //    released by this plugin, not chosen by a loop that had run out of
+    //    things to do, and charging it would stop a goal whose work is
+    //    demonstrably still running — the outcome the cap exists to avoid.
+    if (state.capped) {
+      state.lastRoundsStarted = goal.roundsStarted
+      state.toolCallsInWindow = 0
+      return
+    }
+
+    // 3. A window is only judged once a previous edge defines it: on first
     //    sight there is no window, and guessing one would charge the goal for
     //    rounds that ran before this plugin was mounted.
     if (state.lastRoundsStarted === undefined) {
@@ -533,11 +797,38 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     }
   }
 
+  /**
+   * Pause one goal and record the deferral, arming its deadline.
+   *
+   * The deadline is a timer rather than a timestamp compared on the next visit,
+   * because during a deferral there may be **no** next visit: the goal is
+   * paused, so the driver queues no round, and a stuck child or a hung job
+   * produces no edge at all. A deadline nothing fires on is not a deadline.
+   *
+   * `maxDeferMs` is unset by default, in which case nothing is armed and the
+   * deferral is held for as long as its work is observable — the behaviour every
+   * release before 0.3.0 had.
+   */
+  function writeDeferral(agent: unknown, goal: GoalViewLike, sessionId: string, state: Tracked): void {
+    if (dryRun) {
+      ctx.logger.info(`goal-progress-guard: would pause goal "${goal.id}" while earlier work runs (dry-run)`)
+      return
+    }
+    if (!pauseGoal(agent, goal)) return
+    state.deferred = armDeferral(agent, sessionId)
+  }
+
+  /** The deferral record for one freshly paused goal, with its deadline armed. */
+  function armDeferral(agent: unknown, sessionId: string): Deferral {
+    if (maxDeferMs === undefined || ctx.schedule === undefined) return { agent, disarm: undefined }
+    return { agent, disarm: ctx.schedule(() => { releaseAtDeadline(sessionId) }, maxDeferMs) }
+  }
+
   /** Pause one goal, reporting whether the pause was actually written. */
   function pauseGoal(agent: unknown, goal: GoalViewLike): boolean {
     try {
       ctx.goals.pause(agent, refOf(goal))
-      ctx.logger.info(`goal-progress-guard: paused goal "${goal.id}" while its background jobs run`)
+      ctx.logger.info(`goal-progress-guard: paused goal "${goal.id}" while earlier work runs`)
       return true
     } catch (error: unknown) {
       ctx.logger.warn(`goal-progress-guard: could not pause goal "${goal.id}": ${renderThrown(error)}`)
@@ -545,30 +836,46 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
     }
   }
 
-  /** Reconsider one agent's deferral, whoever triggered the settlement. */
-  function release(agent: unknown): void {
+  /**
+   * Reconsider one agent's deferral, whoever triggered it.
+   *
+   * `deadlineReached` says the deferral outlived `maxDeferMs`, and only the code
+   * that *knows* — the timer that was armed for exactly that — may say so. The
+   * decision is deliberately not re-derived from a clock here: a spent timer
+   * that consulted the clock and found it not yet time would answer "keep
+   * waiting" with nothing left to fire, which is the one outcome worse than
+   * resuming early. A resume the deadline forced is recorded as a capped
+   * episode, which suppresses the next deferral until the work drains.
+   */
+  function release(agent: unknown, deadlineReached: boolean): void {
     const sessionId = sessionIdOf(agent)
     if (sessionId === undefined) return
     const state = states.get(sessionId)
     if (state?.deferred === undefined) return
+    const deferral = state.deferred
     const goal = readGoal(agent)
     const decision = resumeDecision({
       phase: goal?.phase ?? 'absent',
       unsettledJobs: unsettledJobs(sessionId),
+      unsettledSubagents: unsettledSubagents(sessionId),
+      deadlineReached,
     })
     if (decision === 'none') return
+    deferral.disarm?.()
     state.deferred = undefined
     if (decision === 'forget' || goal === undefined) return
     if (dryRun) {
-      ctx.logger.info(`goal-progress-guard: would resume goal "${goal.id}" after its jobs settled (dry-run)`)
+      ctx.logger.info(`goal-progress-guard: would resume goal "${goal.id}" after its work settled (dry-run)`)
       return
     }
     try {
       ctx.goals.resume(agent, refOf(goal))
-      ctx.logger.info(`goal-progress-guard: resumed goal "${goal.id}" after its jobs settled`)
+      ctx.logger.info(`goal-progress-guard: resumed goal "${goal.id}" after its work settled`)
     } catch (error: unknown) {
       ctx.logger.warn(`goal-progress-guard: could not resume goal "${goal.id}": ${renderThrown(error)}`)
+      return
     }
+    if (deadlineReached) state.capped = true
     state.lastRoundsStarted = goal.roundsStarted
     state.toolCallsInWindow = 0
   }
@@ -577,7 +884,14 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
   function releaseSession(sessionId: string): void {
     const state = states.get(sessionId)
     if (state?.deferred === undefined) return
-    release(state.deferred.agent)
+    release(state.deferred.agent, false)
+  }
+
+  /** Lift one session's deferral because the deadline armed for it elapsed. */
+  function releaseAtDeadline(sessionId: string): void {
+    const state = states.get(sessionId)
+    if (state?.deferred === undefined) return
+    release(state.deferred.agent, true)
   }
 
   /**
@@ -593,18 +907,46 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
       return
     }
     for (const state of [...states.values()]) {
-      if (state.deferred !== undefined) release(state.deferred.agent)
+      if (state.deferred !== undefined) release(state.deferred.agent, false)
     }
+  }
+
+  /**
+   * Reconsider a parent's deferral after one of its delegated children stopped.
+   *
+   * The child is the attribution: its durable header names the parent, so
+   * nothing has to be paired or looked up, and a child a provider runs out of
+   * process has no `Agent` here to arrive at all. Anything that is not a
+   * delegated child — a top-level session, a fork — is ignored, which is what
+   * makes this safe on every quiescent edge.
+   */
+  function childSettled(agent: unknown): void {
+    const header = (agent as AgentLike | undefined)?.session?.header
+    if (header?.origin !== 'subagent') return
+    const parent = header.parentSession
+    if (typeof parent !== 'string') return
+    releaseSession(parent)
+  }
+
+  /** Drop one session's bookkeeping, disarming anything it had armed. */
+  function clearState(sessionId: string): void {
+    states.get(sessionId)?.deferred?.disarm?.()
+    states.delete(sessionId)
   }
 
   function forget(agent: unknown): void {
     const sessionId = sessionIdOf(agent)
-    if (sessionId !== undefined) states.delete(sessionId)
+    if (sessionId !== undefined) clearState(sessionId)
   }
 
   /** Install the jobs service once it becomes available. */
   function attachJobs(source: JobsLike): void {
     jobs = source
+  }
+
+  /** Install the agent registry once it becomes available. */
+  function attachAgents(source: AgentsLike): void {
+    agents = source
   }
 
   function observed(sessionId: string): ObservedProgress {
@@ -614,10 +956,11 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
       toolCallsInWindow: state?.toolCallsInWindow ?? 0,
       barrenStreak: state?.barrenStreak ?? 0,
       deferred: state?.deferred !== undefined,
+      capped: state?.capped ?? false,
     }
   }
 
-  return { observeToolCall, evaluate, jobSettled, forget, attachJobs, observed }
+  return { observeToolCall, evaluate, jobSettled, childSettled, forget, attachJobs, attachAgents, observed }
 }
 
 /**
@@ -630,11 +973,19 @@ export function createProgressGuard(ctx: GuardContext, config: Config): Progress
  * @returns one line, prefixed with the plugin name.
  */
 export function mountLine(config: Config): string {
-  const defer = config.deferWhileJobsPending !== false ? 'on' : 'off'
+  const jobs = config.deferWhileJobsPending !== false ? 'on' : 'off'
+  const children = config.deferWhileSubagentsPending !== false ? 'on' : 'off'
   const barren = config.maxBarrenRounds === undefined ? 'unset' : String(config.maxBarrenRounds)
-  return `goal-progress-guard: deferWhileJobsPending=${defer}, maxBarrenRounds=${barren}`
+  const cap = config.maxDeferMs === undefined ? 'unset' : String(config.maxDeferMs)
+  const inert = config.deferWhileJobsPending === false
+    && config.deferWhileSubagentsPending === false
+    && config.maxBarrenRounds === undefined
+  return `goal-progress-guard: deferWhileJobsPending=${jobs}`
+    + `, deferWhileSubagentsPending=${children}`
+    + `, maxDeferMs=${cap}`
+    + `, maxBarrenRounds=${barren}`
     + `${config.dryRun === true ? ' (dry-run)' : ''}`
-    + `${config.deferWhileJobsPending === false && config.maxBarrenRounds === undefined ? ' — the guard is inert' : ''}`
+    + `${inert ? ' — the guard is inert' : ''}`
 }
 
 /**
@@ -657,7 +1008,7 @@ type HarnessEventOn = (
 /**
  * Mount the guard.
  *
- * Three listeners and one optional injection:
+ * Three listeners and two optional injections:
  *
  * - `session/event` counts durable `tool/call` events, which is the evidence
  *   the no-progress rule is decided from;
@@ -666,17 +1017,42 @@ type HarnessEventOn = (
  *   next round. That ordering is not cosmetic: when the driver has no pending
  *   durability checkpoint its listener reaches `agent.followup` synchronously
  *   within the same emit, so a pause registered after it would arrive one round
- *   too late, every round;
- * - `agent/disposed` releases the bookkeeping;
- * - `jobs` is injected optionally, so the no-progress dimension works in a
- *   composition with no background jobs, and the deferral dimension appears
+ *   too late, every round. The same edge is also the child's own settlement:
+ *   a delegated child arriving here has stopped running, so the parent it names
+ *   is reconsidered;
+ * - `agent/disposed` releases the bookkeeping, and for a delegated child it is
+ *   the other way a child stops counting as work in flight;
+ * - `jobs` and `agents` are injected optionally, so the no-progress dimension
+ *   works in a composition with neither, and each deferral dimension appears
  *   only where waiting is actually possible.
  *
  * @param ctx - the plugin context.
  * @param config - the resolved deployment policy.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const guard = createProgressGuard(ctx as unknown as GuardContext, config)
+  // Deadline timers are owned here rather than by the guard, so unloading the
+  // plugin cancels every one of them: an armed timer that outlived its mount
+  // would release a deferral nothing is tracking any more.
+  const timers = new Set<ReturnType<typeof setTimeout>>()
+  ctx.effect(() => () => {
+    for (const handle of timers) clearTimeout(handle)
+    timers.clear()
+  })
+
+  const schedule = (fire: () => void, delayMs: number): (() => void) => {
+    const handle = setTimeout(() => {
+      timers.delete(handle)
+      fire()
+    }, delayMs)
+    timers.add(handle)
+    return () => {
+      clearTimeout(handle)
+      timers.delete(handle)
+    }
+  }
+
+  const harness = ctx as unknown as { goals: GoalsLike; logger: GuardContext['logger'] }
+  const guard = createProgressGuard({ goals: harness.goals, logger: harness.logger, schedule }, config)
   ctx.logger.info(mountLine(config))
 
   const on = ctx.on as unknown as HarnessEventOn
@@ -687,16 +1063,29 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (typeof session?.id === 'string') guard.observeToolCall(session.id)
   })
 
-  // Decision edge, ordered ahead of the driver's own listener.
+  // Decision edge, ordered ahead of the driver's own listener. The child
+  // release rides the same edge: a delegated child that reaches `idle` is work
+  // the parent is no longer waiting for.
   on('agent/status', (payload: { agent: unknown; status?: unknown }) => {
     if (payload?.status !== 'idle') return
     guard.evaluate(payload.agent)
+    guard.childSettled(payload.agent)
   }, { prepend: true })
 
-  on('agent/disposed', (payload: { agent: unknown }) => { guard.forget(payload.agent) })
+  on('agent/disposed', (payload: { agent: unknown }) => {
+    guard.childSettled(payload.agent)
+    guard.forget(payload.agent)
+  })
+
+  // The agent registry is optional by design, exactly as the jobs service is:
+  // a composition without it leaves the child dimension inert and the rest of
+  // the guard untouched.
+  ctx.inject(['agents'], (agentsCtx) => {
+    guard.attachAgents((agentsCtx as unknown as { agents: AgentsLike }).agents)
+  })
 
   // The jobs service is optional by design: a composition without it keeps the
-  // no-progress dimension and leaves the deferral dimension inert.
+  // no-progress dimension and leaves the job dimension inert.
   //
   // Settlements ride the registry's one event stream, subscribed by scope: the
   // plugin serves the composition it is mounted in, and must not hear another
