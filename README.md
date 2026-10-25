@@ -27,6 +27,12 @@ with [#1831](https://github.com/deepseek-ai/deepseek-harness/discussions/1831) a
 
 ## Mount
 
+```sh
+dsh plugin --profile <profile> add github:argszero/cordis-plugin-goal-progress-guard
+```
+
+The git spec installs the tree this README describes; `npm install` on its own never attaches a plugin to a profile — `dsh plugin add` is what writes the row that makes it load.
+
 ```yaml
 - insert:
     - id: goal-progress-guard
